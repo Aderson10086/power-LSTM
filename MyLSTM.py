@@ -44,6 +44,7 @@ class NaiveCustomLSTM(nn.Module):
                 nn.init.xavier_normal_(weight.data)
             else:
                 nn.init.uniform_(weight.data, -std_v, std_v)
+                # use chrono initialization
 
     '''
     这里使用了均匀分布的参数初始化方法，可以修改
@@ -65,13 +66,13 @@ class NaiveCustomLSTM(nn.Module):
             if torch.cuda.is_available():
                 device = torch.device('cuda:0')
                 h_t, c_t = (
-                    torch.zeros(batch_size, self.hidden_size, device=device),
-                    torch.zeros(batch_size, self.hidden_size, device=device)
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64)
                 )
             else:
                 h_t, c_t = (
-                    torch.zeros(batch_size, self.hidden_size),
-                    torch.zeros(batch_size, self.hidden_size)
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64)
                 )
 
         else:
@@ -92,6 +93,68 @@ class NaiveCustomLSTM(nn.Module):
         return hidden_seq, (h_t, c_t)
 
 
+class OptimizeLSTM(nn.Module):
+    """
+    类NaiveCustomLSTM中的张量运算比较耗时，优化一下？
+    """
+
+    def __init__(self, input_sz, hidden_sz):
+        super().__init__()
+        self.input_size = input_sz
+        self.hidden_size = hidden_sz
+        self.U = nn.Parameter(torch.Tensor(input_sz, 4 * hidden_sz))
+        self.W = nn.Parameter(torch.Tensor(hidden_sz, 4 * hidden_sz))
+        self.b = nn.Parameter(torch.Tensor(4 * hidden_sz))
+        self.init_weights()
+
+    def init_weights(self):
+        std_v = 1.0 / np.sqrt(self.hidden_size)
+        for weight in self.parameters():
+            if weight.data.dim() >= 2:
+                nn.init.xavier_normal_(weight.data)
+            else:
+                nn.init.uniform_(weight.data, -std_v, std_v)
+                # use chrono initialization
+
+    def forward(self, x, init_states=None):
+        """
+        设定输入数据张量 x的维度为 [batch_size, sequence_len, feature_size]
+        """
+        batch_size, seq_len, feature_size = x.shape
+        hidden_seq = []
+        if init_states is None:
+            if torch.cuda.is_available():
+                device = torch.device('cuda:0')
+                h_t, c_t = (
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64)
+                )
+            else:
+                h_t, c_t = (
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64)
+                )
+
+        else:
+            h_t, c_t = init_states
+        HS = self.hidden_size
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            gates = x_t @ self.U + h_t @ self.W + self.b
+            f_t, i_t, o_t, c_tilde_t = (
+                torch.sigmoid(gates[:, :HS]),
+                torch.sigmoid(gates[:, HS:2 * HS]),
+                torch.sigmoid(gates[:, 2 * HS:3 * HS]),
+                torch.sigmoid(gates[:, -HS:])
+            )
+            c_t = f_t * c_t + i_t * c_tilde_t
+            h_t = o_t * torch.tanh(c_t)
+            hidden_seq.append(torch.unsqueeze(h_t, dim=0))
+        hidden_seq = torch.cat(hidden_seq, dim=0)
+        hidden_seq = hidden_seq.transpose(0, 1).contiguous()  # contiguous保证了张量在底层存储实在一组连续的内存单元上，增加效率，某些torch的方法要求连续内存
+        return hidden_seq, (h_t, c_t)
+
+
 # 构建个模型玩玩
 class MyModel(nn.Module):
     def __init__(self, n_features, embedding_dim, out_features):
@@ -106,7 +169,7 @@ class MyModel(nn.Module):
         self.input_size = n_features
         self.hidden_size = embedding_dim
         self.output_size = out_features
-        self.LSTM = NaiveCustomLSTM(input_sz=self.input_size, hidden_sz=self.hidden_size)
+        self.LSTM = OptimizeLSTM(input_sz=self.input_size, hidden_sz=self.hidden_size)
         self.Linear = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, x):
@@ -115,11 +178,15 @@ class MyModel(nn.Module):
         return x
 
 
+# 用自己写的LSTM来学习一个正弦曲线
 cuda = torch.device('cuda:0')
-torch.random.manual_seed(100)
-data = torch.randn([2, 2, 2]).to(cuda)
-model = MyModel(2, 10, 2)
+
+data = torch.load('sin_wave.pt', map_location=cuda)
+data = data.reshape(1, len(data), 1)
+
+model = MyModel(1, 21, 1)
 model.to(cuda)
+model.double()
 optimizer = opt.SGD(model.parameters(), lr=0.1, momentum=0.9)
 criterion = nn.MSELoss()
 for i in range(300):
@@ -131,11 +198,27 @@ for i in range(300):
         result = model(data)
         loss = criterion(result, data)
         print(f'loss:{loss}')
-        print(f'output:{result}')
         loss.backward()
         return loss
 
 
     optimizer.step(closure)
+torch.save(model.state_dict(), 'MyLSTM.params')
 
-print(data)
+import matplotlib.pyplot as plt
+
+
+def test():
+    model_test = MyModel(1, 21, 1)
+    model_test.double()
+    model_test.to(cuda)
+    model_test.load_state_dict(torch.load('MyLSTM.params', map_location='cuda'))
+    result = model_test(data)
+    plt.figure()
+    plt.plot(data.cpu().detach().numpy().reshape(1000, ), 'c.', label='real data')
+    plt.plot(result.cpu().detach().numpy().reshape(1000, ), 'k-', label='learned data')
+    plt.legend(loc='upper right')
+    plt.show()
+
+
+test()

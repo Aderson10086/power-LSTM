@@ -21,11 +21,15 @@ h_t = o_t@tanh(c_t)
 
 
 class pLSTM(nn.Module):
-    def __init__(self, input_sz, hidden_sz):
+    def __init__(self, input_sz, hidden_sz, p=None, p_required_learn=False):
         super().__init__()
         self.input_size = input_sz
         self.hidden_size = hidden_sz
-
+        self.p = p
+        if self.p is None and p_required_learn is False:
+            self.p = np.random.uniform(0, 1)
+        elif p_required_learn is True:
+            self.p = nn.Parameter(torch.Tensor(1))
         # r_t = sigma(U_r X_t + W_r h_{t-1} + b_r)
         self.U_r = nn.Parameter(torch.Tensor(input_sz, hidden_sz))
         self.W_r = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz))
@@ -38,17 +42,22 @@ class pLSTM(nn.Module):
         self.U_o = nn.Parameter(torch.Tensor(input_sz, hidden_sz))
         self.W_o = nn.Parameter(torch.Tensor(hidden_sz, hidden_sz))
         self.b_o = nn.Parameter(torch.Tensor(hidden_sz))
-        self.init_weights()
+        self.init_weights()  # p的初始化必须在此函数之后，因为init_weights()会初始化p参数，后面再次初始化进行覆盖
+        if p_required_learn:
+            if torch.cuda.is_available():
+                self.p.data = torch.sigmoid(torch.randint(low=-10, high=10, size=(1,), device=torch.device('cuda:0')))
+            else:
+                self.p.data = torch.sigmoid(torch.randint(low=-10, high=10, size=(1,)))
 
     def init_weights(self):
         std_v = 1.0 / np.sqrt(self.hidden_size)
         for weight in self.parameters():
             if weight.data.dim() >= 2:
                 nn.init.xavier_normal_(weight.data)
-            else:
+            elif weight.data.dim != 0:
                 nn.init.uniform_(weight.data, -std_v, std_v)
 
-    def forward(self, x, time_seq, init_states=None, p=None, epsilon=0.001, p_required_learn=False):
+    def forward(self, x, time_seq, init_states=None, epsilon=0.001):
         """
         设定输入数据张量 x的维度为 [batch_size, sequence_len, feature_size]
         time_seq表示的是输入数据的时间, 维度为[batch_size, sequence_len, 1] 时间是一个维度特征的数据，所以第三个维度为1
@@ -73,15 +82,6 @@ class pLSTM(nn.Module):
         else:
             h_t, c_t, k_t = init_states
 
-        if p is None and p_required_learn is False:
-            p = np.random.uniform(0, 1)
-        elif p_required_learn is True:
-            p = nn.Parameter(torch.Tensor(1))
-            if torch.cuda.is_available():
-                p.data = torch.sigmoid(torch.randint(low=-1000, high=1000, size=(1,), device=torch.device('cuda:0')))
-            else:
-                p.data = torch.sigmoid(torch.randint(low=-1000, high=1000, size=(1,)))
-
         '''
         r_t = sigma(U_r X_t + W_r h_{t-1} + b_r)
         k_t = r_t @ t + (1-r_t)@k_{t-1}
@@ -101,7 +101,7 @@ class pLSTM(nn.Module):
             r_t = torch.sigmoid(x_t @ self.U_r + h_t @ self.W_r + self.b_r)
             k_t = r_t * t + (1 - r_t) * k_t
             c_tilde_t = torch.tanh(x_t @ self.U_c + h_t @ self.W_c + self.b_c)
-            f_t = torch.pow((t - k_t + 1) / (t - k_t + epsilon), -p)
+            f_t = torch.pow((t - k_t + 1) / (t - k_t + epsilon), -self.p)
             i_t = 1 - f_t
             c_t = f_t * c_t + i_t * c_tilde_t
             o_t = torch.sigmoid(x_t @ self.U_o + h_t @ self.W_o + self.b_o)
@@ -119,46 +119,66 @@ class MyModel(nn.Module):
         self.input_size = input_features
         self.hidden_size = embedding_dim
         self.output_size = output_dim
-        self.LSTM = pLSTM(self.input_size, self.hidden_size)
+        self.LSTM = pLSTM(self.input_size, self.hidden_size, p=0.3, p_required_learn=False)
         self.Linear = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, x, time):
-        result, (_, _) = self.LSTM(x, time, p_required_learn=False)
+        result, (_, _) = self.LSTM(x, time)
         result = self.Linear(result)
         return result
 
 
 cuda = torch.device('cuda:0')
-torch.random.manual_seed(100)
-data = torch.randn([2, 2, 2], dtype=torch.float64).to(cuda)
-time_seq = torch.tensor([[0.05, 0.1], [0.15, 0.2]], dtype=torch.float64).unsqueeze(dim=2).to(cuda)
+# power LSTM to learn a sine wave function
 
-model = MyModel(2, 10, 2)
+data = torch.load('sin_wave.pt', map_location=cuda)
+data = data.reshape(1, len(data), 1)
+data_train = data[:, :-1, :].reshape(1, 999, 1)
+data_target = data[:, 1:, :].reshape(1, 999, 1)
+time = torch.load('time_sin_wave.pt', map_location=cuda)
+time_seq = time.reshape(1, len(time), 1)
+
+model = MyModel(1, 21, 1)
+model.to(cuda)
 model.double()
 model.zero_grad()
-model.to(cuda)
 criterion = nn.MSELoss()
+# optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999))
-for i in range(300):
+loss_record = []
+p_record = []
+for i in range(500):
     print(f'step:{i}')
+
 
     def closure():
         optimizer.zero_grad()
         result = model(data, time_seq)
-        loss = criterion(result, time_seq)
-        print(f'loss========>{loss}')
-        print(f'output:{result}')
+        loss = criterion(data, result)
+        print(f'training loss==========>{loss.item()}')
+        loss_record.append(loss)
         loss.backward()
+        # name, p_value = list(model.named_parameters())[0]
+        # p_record.append(p_value.data.cpu().detach().numpy())
+        # print(p_value.data) #当p是可学习的参数时候，可以增加此处的代码，用来检测p的变化
         return loss
     optimizer.step(closure)
 
-print(data)
-'''
-loss========>1.9170325807885693e-07
-output:tensor([[[ 2.6167e-04, -2.5268e-04],
-         [ 1.0006e+00,  9.9939e-01]],
+torch.save(model.state_dict(), 'pLSTM.params')
 
-        [[ 9.9968e-01,  1.0003e+00],
-         [ 2.0005e+00,  1.9995e+00]]], device='cuda:0', dtype=torch.float64,
-       grad_fn=<ViewBackward0>)
-'''
+import matplotlib.pyplot as plt
+
+def test():
+    model_test = MyModel(1, 21, 1)
+    model_test.double()
+    model_test.to(cuda)
+    model_test.load_state_dict(torch.load('pLSTM.params', map_location='cuda'))
+    result = model_test(data_train, time_seq)
+    plt.figure()
+    plt.plot(data_target.cpu().detach().numpy().reshape(999, ), 'c.', label='real data')
+    plt.plot(result.cpu().detach().numpy().reshape(999, ), 'k-', label='learned data')
+    plt.legend(loc='upper right')
+    plt.show()
+
+
+test()
