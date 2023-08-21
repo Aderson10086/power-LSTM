@@ -65,13 +65,13 @@ class NaiveCustomLSTM(nn.Module):
             if torch.cuda.is_available():
                 device = torch.device('cuda:0')
                 h_t, c_t = (
-                    torch.zeros(batch_size, self.hidden_size, device=device),
-                    torch.zeros(batch_size, self.hidden_size, device=device)
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, device=device, dtype=torch.float64)
                 )
             else:
                 h_t, c_t = (
-                    torch.zeros(batch_size, self.hidden_size),
-                    torch.zeros(batch_size, self.hidden_size)
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64),
+                    torch.zeros(batch_size, self.hidden_size, dtype=torch.float64)
                 )
 
         else:
@@ -115,11 +115,15 @@ class MyModel(nn.Module):
         return x
 
 
+# 用自己写的LSTM来学习一个正弦曲线
 cuda = torch.device('cuda:0')
-torch.random.manual_seed(100)
-data = torch.randn([2, 2, 2]).to(cuda)
-model = MyModel(2, 10, 2)
+
+data = torch.load('sin_wave.pt', map_location=cuda)
+data = data.reshape(1, len(data), 1)
+'''
+model = MyModel(1, 21, 1)
 model.to(cuda)
+model.double()
 optimizer = opt.SGD(model.parameters(), lr=0.1, momentum=0.9)
 criterion = nn.MSELoss()
 for i in range(300):
@@ -131,11 +135,27 @@ for i in range(300):
         result = model(data)
         loss = criterion(result, data)
         print(f'loss:{loss}')
-        print(f'output:{result}')
         loss.backward()
         return loss
 
 
     optimizer.step(closure)
+torch.save(model.state_dict(), 'MyLSTM.params')
+'''
 
-print(data)
+import matplotlib.pyplot as plt
+
+
+def test():
+    model_test = MyModel(1, 21, 1)
+    model_test.double()
+    model_test.to(cuda)
+    model_test.load_state_dict(torch.load('MyLSTM.params', map_location='cuda'))
+    result = model_test(data)
+    plt.figure()
+    plt.plot(data.cpu().detach().numpy().reshape(1000, ), 'c-')
+    plt.plot(result.cpu().detach().numpy().reshape(1000, ), 'k.')
+    plt.show()
+
+
+test()
