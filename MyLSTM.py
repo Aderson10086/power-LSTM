@@ -13,6 +13,8 @@ import torch.nn as nn
 import numpy as np
 import torch.optim as opt
 
+torch.manual_seed(100)
+
 
 class NaiveCustomLSTM(nn.Module):
     def __init__(self, input_sz: int, hidden_sz: int):
@@ -174,8 +176,34 @@ class MyModel(nn.Module):
 
     def forward(self, x):
         x, (_, _) = self.LSTM(x)
+        x = self.universe_attention_layer(x)
         x = self.Linear(x)
         return x
+
+    def attention_layer(self, x):
+        """
+        对lstm的输出进行attention操作
+        """
+        # 首先来使用点积的attention操作，就是把输出的每个时间步骤的向量看成一个线性空间，计算线性空间中的表示，然后把表示输出出来当做计算结果
+        # lstm网络输出的output的形状是[batch_size, seq_len, hidden_size], 对seq_len做 attention
+        # 每个向量之间的内积
+        vec_coffe = torch.bmm(x, x.permute(0, 2, 1))
+        # 归一化系数
+        vec_coffe = torch.softmax(vec_coffe, dim=-1)
+        output = torch.bmm(vec_coffe, x)
+        return output
+
+    def universe_attention_layer(self, x):
+        """
+        具体的计算公式为 xWx^{T}
+        """
+        _, seq_len, hidden_size = x.shape
+        W_matrix = nn.Linear(hidden_size, hidden_size, device=cuda, dtype=torch.float64, bias=False)
+        vec_coffe = torch.bmm(W_matrix(x), x.permute(0, 2, 1))  # xW^{T}x^{T}
+        vec_coffe = torch.softmax(vec_coffe, dim=-1)
+        out = torch.bmm(vec_coffe, x)
+        layer = nn.ReLU()
+        return layer(out)
 
 
 # 用自己写的LSTM来学习一个正弦曲线
@@ -187,23 +215,30 @@ data = data.reshape(1, len(data), 1)
 model = MyModel(1, 21, 1)
 model.to(cuda)
 model.double()
-optimizer = opt.SGD(model.parameters(), lr=0.1, momentum=0.9)
+# print(list(model.named_parameters()))
+# optimizer = opt.SGD(model.parameters(), lr=0.01, momentum=0.98)
+optimizer = opt.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999))
 criterion = nn.MSELoss()
-for i in range(300):
+
+loss_record = []
+for i in range(1000):
     print(f'step:{i}')
 
 
     def closure():
         optimizer.zero_grad()
-        result = model(data)
-        loss = criterion(result, data)
+        result = model(data[:, :-1, :])
+        loss = criterion(result, data[:, 1:, :])
         print(f'loss:{loss}')
+        loss_record.append(loss.item())
         loss.backward()
+
         return loss
 
 
     optimizer.step(closure)
 torch.save(model.state_dict(), 'MyLSTM.params')
+torch.save(loss_record, 'loss_with_universe_attention.pt')
 
 import matplotlib.pyplot as plt
 
@@ -213,10 +248,10 @@ def test():
     model_test.double()
     model_test.to(cuda)
     model_test.load_state_dict(torch.load('MyLSTM.params', map_location='cuda'))
-    result = model_test(data)
+    result = model_test(data[:, :-1, :])
     plt.figure()
-    plt.plot(data.cpu().detach().numpy().reshape(1000, ), 'c.', label='real data')
-    plt.plot(result.cpu().detach().numpy().reshape(1000, ), 'k-', label='learned data')
+    plt.plot(data[:, 1:, :].cpu().detach().numpy().reshape(999, ), 'c-', label='real data', linewidth=0.5)
+    plt.plot(result.cpu().detach().numpy().reshape(999, ), 'k-', label='learned data')
     plt.legend(loc='upper right')
     plt.show()
 
